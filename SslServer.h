@@ -8,6 +8,12 @@
 #include <openssl/bio.h>
 #include <sys/epoll.h>
 
+namespace ssl_server {
+
+void Init();
+
+void CleanUp();
+
 class Buffer {
  public:
   Buffer();
@@ -25,14 +31,11 @@ class Buffer {
 
 class SslConnection {
  public:
-  SslConnection(int fd, const std::string& peer_ip_addr, uint16_t peer_port);
+  SslConnection(int fd, const std::string& peer_ip_addr, uint16_t peer_port,
+                SSL_CTX* ssl_ctx);
   SslConnection(const SslConnection&) = delete;
   ~SslConnection();
-  template <typename T>
-  bool Send(T&& buf) {
-    out_buffer_.Write(std::forward<T>(buf));
-    return Send();
-  }
+  bool Send(const std::string& buf);
   void Shutdown();
   void HandleEvents(uint32_t revents);
   int fd() const;
@@ -46,10 +49,14 @@ class SslConnection {
 
  private:
   bool Send();
+  void Encrypt();
+  int Decrypt();
+  int HandleSslError(int n);
 
   int clientfd_;
   std::string peer_ip_;
   uint16_t peer_port_;
+  SSL* ssl_engine_;
   BIO* in_bio_;
   BIO* out_bio_;
   Buffer in_buffer_;
@@ -68,8 +75,6 @@ class SslServer {
   SslServer(const SslServer&) = delete;
   ~SslServer();
   void Run();
-  void set_connection_callback(
-      const std::function<void(SslConnection*)>& callback);
   void set_message_callback(
       const std::function<void(SslConnection*, Buffer*)>& callback);
 
@@ -79,10 +84,13 @@ class SslServer {
 
   int serverfd_;
   int pollfd_;
-  std::function<void(SslConnection*)> connection_callback_;
   std::function<void(SslConnection*, Buffer*)> message_callback_;
   std::map<int, SslConnection*> connections_;
   struct epoll_event evts_[kMaxPollEventNum];
+
+  SSL_CTX* ssl_ctx_;
 };
+
+}  // namespace ssl_server
 
 #endif

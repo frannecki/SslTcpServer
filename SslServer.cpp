@@ -7,28 +7,21 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <openssl/err.h>
-#include <openssl/ssl.h>
-
 #include "SslServer.h"
+#include "utils.h"
 
 using namespace std::placeholders;
 
+namespace ssl_server {
+
 static const int kMaxBufferLen = 1024;
-static char err_msg[kMaxBufferLen];
 
-#define exit_err                                                    \
-  fprintf(stderr, "[%s:%u %s] ", __FILE__, __LINE__, __FUNCTION__); \
-  exit_err_msg
-
-static void exit_err_msg(const char* fmt, ...) {
-  va_list args;
-  va_start(args, fmt);
-  vsnprintf(err_msg, sizeof(err_msg), fmt, args);
-  va_end(args);
-  perror(err_msg);
-  exit(EXIT_FAILURE);
+void Init() {
+  fprintf(stdout, "Initializing ssl utilities.\n");
+  ssl_init();
 }
+
+void CleanUp() { EVP_cleanup(); }
 
 Buffer::Buffer() : read_index_(0), write_index_(0) {}
 
@@ -65,7 +58,7 @@ int Buffer::ReadableBytes() { return write_index_ - read_index_; }
 
 bool Buffer::Empty() const { return read_index_ == write_index_; }
 
-static SslConnection* AcceptSocket(int serverfd, int pollfd) {
+static SslConnection* AcceptSocket(int serverfd, int pollfd, SSL_CTX* ssl_ctx) {
   struct sockaddr_in addr;
   socklen_t addr_len = sizeof(addr);
   int clientfd =
@@ -79,13 +72,14 @@ static SslConnection* AcceptSocket(int serverfd, int pollfd) {
   uint16_t port = htons(addr.sin_port);
   fprintf(stdout, "Accepted connection from %s:%u\n", ip_addr, port);
 
-  SslConnection* conn =
-      new SslConnection(clientfd, std::string(ip_addr, strlen(ip_addr)), port);
+  SslConnection* conn = new SslConnection(
+      clientfd, std::string(ip_addr, strlen(ip_addr)), port, ssl_ctx);
 
   struct epoll_event evt;
+  memset(&evt, 0, sizeof(evt));
   evt.data.fd = clientfd;
   evt.data.ptr = conn;
-  evt.events = EPOLLIN | EPOLLRDHUP | EPOLLHUP;
+  evt.events = EPOLLIN | EPOLLRDHUP;
   if (epoll_ctl(pollfd, EPOLL_CTL_ADD, clientfd, &evt) < 0) {
     exit_err("epoll_ctl");
   }
@@ -96,6 +90,11 @@ SslServer::SslServer(uint32_t ip, uint16_t port)
     : serverfd_(socket(AF_INET, SOCK_STREAM, 0)), pollfd_(epoll_create1(0)) {
   if (serverfd_ < 0) {
     exit_err("socket");
+  }
+  int enable = 1;
+  if (setsockopt(serverfd_, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable)) <
+      0) {
+    exit_err("setsockopt");
   }
 
   struct sockaddr_in addr;
@@ -110,18 +109,27 @@ SslServer::SslServer(uint32_t ip, uint16_t port)
     exit_err("listen");
   }
 
+  fprintf(stdout, "Listening on port %u. fd = %d\n", port, serverfd_);
+
   if (pollfd_ < 0) {
     exit_err("epoll_create1");
   }
   struct epoll_event evt;
+  memset(&evt, 0, sizeof(evt));
   evt.data.fd = serverfd_;
   evt.events = EPOLLIN;
   if (epoll_ctl(pollfd_, EPOLL_CTL_ADD, serverfd_, &evt) < 0) {
     exit_err("epoll_ctl");
   }
+
+  ssl_ctx_ = create_context();
+  configure_context(ssl_ctx_);
 }
 
-SslServer::~SslServer() { close(serverfd_); }
+SslServer::~SslServer() {
+  close(serverfd_);
+  SSL_CTX_free(ssl_ctx_);
+}
 
 void SslServer::Run() {
   while (1) {
@@ -134,14 +142,20 @@ void SslServer::Run() {
       uint32_t revents = evts_[idx].events;
       if (fd == serverfd_) {
         if (revents & EPOLLIN) {
-          SslConnection* conn = AcceptSocket(serverfd_, pollfd_);
+          SslConnection* conn = AcceptSocket(serverfd_, pollfd_, ssl_ctx_);
+          if (connections_.size() + 1 >= kMaxPollEventNum) {
+            struct linger lo = { 1, 0 };
+            // reset connection
+            setsockopt(conn->fd(), SOL_SOCKET, SO_LINGER, &lo, sizeof(lo));
+            delete conn;
+            continue;
+          }
           conn->set_read_callback(message_callback_);
           conn->set_want_write_callback(
               std::bind(&SslServer::PollOnWrite, this, _1, _2));
           conn->set_close_callback(
               std::bind(&SslServer::CloseConnection, this, _1));
           connections_.insert(std::pair<int, SslConnection*>(conn->fd(), conn));
-          if (connection_callback_) connection_callback_(conn);
         }
       } else {
         // Getting bad descriptor evts_[idx].data.fd here
@@ -155,11 +169,6 @@ void SslServer::Run() {
   }
 }
 
-void SslServer::set_connection_callback(
-    const std::function<void(SslConnection*)>& callback) {
-  connection_callback_ = callback;
-}
-
 void SslServer::set_message_callback(
     const std::function<void(SslConnection*, Buffer*)>& callback) {
   message_callback_ = callback;
@@ -168,6 +177,7 @@ void SslServer::set_message_callback(
 void SslServer::PollOnWrite(SslConnection* conn, bool want_write) {
   uint32_t revents = EPOLLIN | EPOLLRDHUP | EPOLLHUP;
   struct epoll_event evt;
+  memset(&evt, 0, sizeof(evt));
   if (want_write) {
     revents |= EPOLLOUT;
   }
@@ -190,13 +200,46 @@ void SslServer::CloseConnection(int fd) {
 }
 
 SslConnection::SslConnection(int fd, const std::string& peer_ip_addr,
-                             uint16_t peer_port)
-    : clientfd_(fd), peer_ip_(peer_ip_addr), peer_port_(peer_port) {}
+                             uint16_t peer_port, SSL_CTX* ssl_ctx)
+    : clientfd_(fd),
+      peer_ip_(peer_ip_addr),
+      peer_port_(peer_port),
+      ssl_engine_(SSL_new(ssl_ctx)),
+      in_bio_(BIO_new(BIO_s_mem())),
+      out_bio_(BIO_new(BIO_s_mem())) {
+  SSL_set_accept_state(ssl_engine_);
+  SSL_set_bio(ssl_engine_, in_bio_, out_bio_);
+}
 
 SslConnection::~SslConnection() {
   if (close(clientfd_) < 0) {
     exit_err("close");
   }
+  SSL_free(ssl_engine_);
+  // BIO_free(in_bio_);
+  // BIO_free(out_bio_);
+  ssl_engine_ = nullptr;
+  in_bio_ = out_bio_ = nullptr;
+}
+
+bool SslConnection::Send(const std::string& buf) {
+  if (!SSL_is_init_finished(ssl_engine_)) {
+    return true;
+  }
+  // encrypt all data
+  int len = buf.size();
+  int n_written = 0;
+  while (n_written < len) {
+    int n = SSL_write(ssl_engine_, buf.c_str() + n_written, len - n_written);
+    if (n > 0) {
+      n_written += n;
+      this->Encrypt();
+    } else {
+      break;
+    }
+  }
+
+  return Send();
 }
 
 void SslConnection::Shutdown() {
@@ -214,11 +257,43 @@ void SslConnection::HandleEvents(uint32_t revents) {
     if (!Send()) return;
   }
   if (revents & (EPOLLIN | EPOLLRDHUP)) {
-    char buffer[kMaxBufferLen];
-    int ret = recv(clientfd_, buffer, kMaxBufferLen, 0);
+    char sock_buffer[kMaxBufferLen];
+    int ret = recv(clientfd_, sock_buffer, kMaxBufferLen, 0);
+
     if (ret > 0) {
-      in_buffer_.Write(std::string(buffer, ret));
-      if (read_callback_) read_callback_(this, &in_buffer_);
+      int cur = 0;
+
+      while (cur < ret) {
+        int n = BIO_write(in_bio_, sock_buffer + cur, ret - cur);
+        if (n <= 0) {
+          exit_err("BIO_write");
+        }
+        cur += n;
+
+        if (!SSL_is_init_finished(ssl_engine_)) {
+          int n_accepted = SSL_do_handshake(ssl_engine_);
+
+          if (n_accepted > 0) {
+            fprintf(stdout, "SSL handshake finished for client %s:%u\n",
+                    peer_ip_.c_str(), peer_port_);
+          }
+
+          if (HandleSslError(n_accepted) < 0) {
+            close_callback_(clientfd_);
+            return;
+          }
+
+          if (!SSL_is_init_finished(ssl_engine_)) {
+            continue;
+          }
+        }
+
+        int n_read = this->Decrypt();
+        if (HandleSslError(n_read) < 0) {
+          close_callback_(clientfd_);
+          return;
+        }
+      }
     } else if (ret == 0) {
       Shutdown();
     } else {
@@ -232,6 +307,50 @@ void SslConnection::HandleEvents(uint32_t revents) {
       exit_err("recv. errno: %d", errno);
     }
   }
+}
+
+void SslConnection::Encrypt() {
+  char ssl_buffer[kMaxBufferLen];
+  int n_ssl_read;
+  while (1) {
+    n_ssl_read = BIO_read(out_bio_, ssl_buffer, kMaxBufferLen);
+
+    if (n_ssl_read > 0) {
+      out_buffer_.Write(std::string(ssl_buffer, n_ssl_read));
+    } else {
+      break;
+    }
+  }
+
+  // this is necessary for ssl server hello to be sent out
+  if (want_write_callback_) want_write_callback_(this, true);
+}
+
+int SslConnection::Decrypt() {
+  char ssl_buffer[kMaxBufferLen];
+  int n_read;
+  while (1) {
+    n_read = SSL_read(ssl_engine_, ssl_buffer, kMaxBufferLen);
+    if (n_read <= 0) break;
+    in_buffer_.Write(std::string(ssl_buffer, n_read));
+    if (read_callback_) read_callback_(this, &in_buffer_);
+  }
+  return n_read;
+}
+
+int SslConnection::HandleSslError(int n) {
+  if (n > 0) return 1;
+  int err = SSL_get_error(ssl_engine_, n);
+  switch (err) {
+    case SSL_ERROR_WANT_WRITE:
+    case SSL_ERROR_WANT_READ:
+      // might be ssl renegotiation
+      this->Encrypt();
+      break;
+    default:
+      return -1;
+  }
+  return 0;
 }
 
 int SslConnection::fd() const { return clientfd_; }
@@ -283,3 +402,5 @@ bool SslConnection::Send() {
   out_buffer_.HaveRead(nbytes);
   return true;
 }
+
+}  // namespace ssl_server
