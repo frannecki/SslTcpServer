@@ -20,6 +20,9 @@ int main(int argc, char** argv) {
   SSL_CTX* ssl_ctx = create_context(false);
 
   int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK) < 0) {
+    exit_err("fcntl");
+  }
 
   struct sockaddr_in addr;
   socklen_t addr_len;
@@ -46,13 +49,14 @@ int main(int argc, char** argv) {
   SSL_set_fd(ssl, fd);
   SSL_set_connect_state(ssl);
 
-  int n_ssl_connect = SSL_do_handshake(ssl);
+  // int n_ssl_connect = SSL_do_handshake(ssl);
 
   struct pollfd poll_fd;
   poll_fd.fd = fd;
   poll_fd.events = POLLIN | POLLRDHUP | POLLOUT;
 
   while (1) {
+    bool want_write = false;
     int ret = poll(&poll_fd, 1, -1);
     if (ret < 0) {
       exit_err("poll");
@@ -62,7 +66,9 @@ int main(int argc, char** argv) {
     }
     if (poll_fd.revents & (POLLIN | POLLRDHUP)) {
       int n_read = SSL_read(ssl, buff, kMaxBufferLen);
-      if (n_read <= 0) {
+      if (n_read < 0) {
+        continue;
+      } else if (n_read == 0) {
         break;
       } else {
         buff[n_read] = 0;
@@ -72,12 +78,15 @@ int main(int argc, char** argv) {
     if (poll_fd.revents & POLLOUT) {
       if (!SSL_is_init_finished(ssl)) {
         int n_ssl_connect = SSL_do_handshake(ssl);
-        if (!SSL_is_init_finished(ssl)) {
-        }
+        want_write = true;
+      } else {
+        SSL_write(ssl, buff, strlen(buff));
       }
-      SSL_write(ssl, buff, strlen(buff));
     }
-    poll_fd.events &= (~POLLOUT);
+    if (want_write)
+      poll_fd.events |= POLLOUT;
+    else
+      poll_fd.events &= (~POLLOUT);
   }
 
   close(fd);
